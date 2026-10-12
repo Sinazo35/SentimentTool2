@@ -1,0 +1,377 @@
+import csv
+import io
+import json
+import os
+import re
+from collections import Counter
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from flask import Flask, jsonify, render_template, request
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from youtube_transcript_api import YouTubeTranscriptApi
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+vader = SentimentIntensityAnalyzer()
+MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+classifier = None
+HISTORY_FILE = Path(os.environ.get("PULSE_SCOPE_HISTORY", "data/history.json"))
+
+
+def get_classifier():
+    global classifier
+    if classifier is None:
+        try:
+            from huggingface_hub import InferenceClient
+            classifier = InferenceClient(model=MODEL, timeout=60)
+        except Exception as exc:
+            raise RuntimeError("Hugging Face inference could not be initialized.") from exc
+    return classifier
+
+
+def split_sentences(text):
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if sentence.strip()
+    ]
+
+
+def classify_huggingface_texts(texts):
+    """InferenceClient text_classification expects a single string per call."""
+    client = get_classifier()
+    predictions = []
+    for sentence in texts[:30]:
+        try:
+            response = client.text_classification(sentence[:1500], top_k=1)
+            if not response:
+                raise ValueError("Empty model response")
+            item = response[0] if isinstance(response, list) else response
+            label = item.get("label") if isinstance(item, dict) else item.label
+            score = item.get("score") if isinstance(item, dict) else item.score
+            predictions.append({"label": str(label).lower(), "confidence": round(float(score), 4)})
+        except Exception as exc:
+            raise RuntimeError("Hugging Face inference is unavailable. Try VADER only, or configure HF_TOKEN for hosted inference.") from exc
+    return predictions
+
+
+def created_at():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def classify_compound(score):
+    if score >= 0.05:
+        return "positive"
+    if score <= -0.05:
+        return "negative"
+    return "neutral"
+
+
+def video_id(url):
+    if not isinstance(url, str):
+        raise ValueError("Enter a valid YouTube video link.")
+
+    raw = url.strip()
+    if not raw:
+        raise ValueError("Enter a valid YouTube video link.")
+
+    value = ""
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+
+    if host in {"youtu.be", "www.youtu.be"}:
+        value = parsed.path.strip("/").split("/", 1)[0]
+    elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}:
+        if parsed.path in {"/watch", "/watch/"}:
+            value = parse_qs(parsed.query).get("v", [""])[0]
+        elif parsed.path.startswith(("/shorts/", "/live/", "/embed/", "/v/")):
+            value = parsed.path.strip("/").split("/", 2)[1] if parsed.path.startswith("/embed/") else parsed.path.strip("/").split("/", 1)[1]
+        else:
+            value = ""
+
+    if not value:
+        fallback = re.search(r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/|live/|v/)|youtu\.be/|youtube-nocookie\.com/embed/)([A-Za-z0-9_-]{11})", raw, re.IGNORECASE)
+        if fallback:
+            value = fallback.group(1)
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        raise ValueError("Enter a valid YouTube video link.")
+    return value
+
+
+def chunks_from_text(text):
+    text = text.strip()
+    if not text:
+        raise ValueError("Please provide some text to analyze.")
+    chunks = []
+    for part in re.split(r"(?<=[.!?])\s+|\n+", text):
+        part = part.strip()
+        if part:
+            chunks.append({"text": part, "start": None})
+    return chunks
+
+
+def youtube_transcript_error(exc):
+    message = str(exc).lower()
+    if any(term in message for term in ("requestblocked", "ipblocked", "blocked by youtube", "cloud provider")):
+        return (
+            "YouTube is blocking transcript requests from this deployment's IP address. "
+            "Use the Paste transcript option instead, or run the app on a non-blocked IP."
+        )
+    return "Could not retrieve the YouTube transcript. The video may have no English captions or YouTube may be temporarily unavailable."
+
+
+def chunks_from_youtube(url):
+    identifier = video_id(url)
+    try:
+        raw = YouTubeTranscriptApi().fetch(identifier, languages=["en", "en-US", "en-GB"]).to_raw_data()
+    except Exception as exc:
+        raise ValueError(youtube_transcript_error(exc)) from exc
+    if not raw:
+        raise ValueError("No English transcript was returned for this video.")
+
+    # Analyze caption windows rather than collapsing an entire video into one result.
+    # This gives meaningful sentiment counts, timeline and dashboard visualizations.
+    chunks, buffer, start = [], [], None
+    for item in raw:
+        line = re.sub(r"\[[^]]+\]", "", item.get("text", "")).strip()
+        if not line:
+            continue
+        if start is None:
+            start = float(item.get("start", 0))
+        buffer.append(line)
+        if len(" ".join(buffer)) >= 350:
+            chunks.append({"text": " ".join(buffer), "start": start, "video_id": identifier})
+            buffer, start = [], None
+    if buffer:
+        chunks.append({"text": " ".join(buffer), "start": start, "video_id": identifier})
+    if not chunks:
+        raise ValueError("No usable transcript text was found.")
+    return chunks[:400]
+
+
+def demo_chunks():
+    return chunks_from_text(
+        "I absolutely love the way this product makes everyday work feel effortless. "
+        "The thoughtful design and fast support are a real joy. The launch experience was "
+        "slightly confusing, but the team quickly fixed it. I am disappointed that the "
+        "mobile app still has small performance issues. Overall, the service is reliable and "
+        "the new features are attractive. I wish the pricing were clearer and the onboarding "
+        "felt a little more personal."
+    )
+
+
+def analyze(parts, engine):
+    original_total = len(parts)
+    is_whole_video = bool(parts and parts[0].get("video_id"))
+    model = None
+    hf_error = None
+    if engine in {"huggingface", "both"}:
+        try:
+            model = get_classifier()
+        except RuntimeError as exc:
+            hf_error = str(exc)
+            if engine == "huggingface":
+                raise
+
+    results = []
+    sentence_groups = []
+    for part in parts:
+        sentence_groups.extend(split_sentences(part["text"]))
+
+    sentence_predictions = []
+    if model and sentence_groups:
+        try:
+            sentence_predictions = classify_huggingface_texts(sentence_groups[:30])
+        except RuntimeError as exc:
+            hf_error = str(exc)
+            if engine == "huggingface":
+                raise
+
+    prediction_by_sentence = {
+        sentence: prediction
+        for sentence, prediction in zip(sentence_groups[:30], sentence_predictions)
+    }
+    for index, part in enumerate(parts, 1):
+        score = vader.polarity_scores(part["text"])
+        vader_label = classify_compound(score["compound"])
+        hf = None
+        if model and prediction_by_sentence:
+            sentences = split_sentences(part["text"])
+            if sentences:
+                hf = prediction_by_sentence.get(sentences[0], {"label": "neutral", "confidence": 0.0})
+                hf = dict(hf)
+                hf["count"] = len(sentences)
+        results.append(
+            {
+                "index": index,
+                "text": part["text"],
+                "start": part["start"],
+                "label": vader_label,
+                "vader_label": vader_label,
+                "compound": round(score["compound"], 4),
+                "positive": round(score["pos"], 4),
+                "negative": round(score["neg"], 4),
+                "neutral": round(score["neu"], 4),
+                "huggingface": hf,
+            }
+        )
+
+    drivers = []
+    for index, (sentence, prediction) in enumerate(prediction_by_sentence.items(), 1):
+        if prediction["label"] in {"positive", "negative"}:
+            drivers.append(
+                {
+                    "part_index": index,
+                    "text": sentence,
+                    "label": prediction["label"],
+                    "confidence": prediction["confidence"],
+                    "vader_compound": round(vader.polarity_scores(sentence)["compound"], 4),
+                }
+            )
+
+    drivers.sort(key=lambda item: item["confidence"], reverse=True)
+    drivers = drivers[:8]
+    counts = Counter(result["label"] for result in results)
+    average = round(sum(result["compound"] for result in results) / len(results), 4)
+    overall = classify_compound(average)
+    return {
+        "generated_at": created_at(),
+        "segments": results,
+        "summary": {
+            "total": len(results),
+            "counts": {label: counts.get(label, 0) for label in ("positive", "negative", "neutral")},
+            "average_compound": average,
+            "overall_vader": overall,
+            "engine": engine,
+            "original_total": original_total,
+            "truncated": len(parts) >= 400,
+            "whole_video": is_whole_video,
+            "note": "VADER compound is a normalized polarity score from -1 to +1. Hugging Face labels are model predictions. YouTube analysis uses caption windows to show sentiment changes over time.",
+            "hf_error": hf_error,
+        },
+        "drivers": drivers,
+    }
+
+
+@app.get("/")
+def home():
+    return render_template("index.html")
+
+
+@app.post("/api/analyze")
+def api_analyze():
+    try:
+        payload = request.get_json(silent=True) or {}
+        engine = payload.get("engine", "both")
+        if engine not in {"vader", "huggingface", "both"}:
+            raise ValueError("Invalid analysis engine.")
+        source = payload.get("source", "text")
+        if source == "youtube":
+            parts = chunks_from_youtube(payload.get("url", ""))
+        elif source == "text":
+            parts = chunks_from_text(payload.get("text", ""))
+        elif source == "demo":
+            parts = demo_chunks()
+        else:
+            raise ValueError("Select a valid source.")
+        result = analyze(parts, engine)
+        result["source"] = source
+        if source == "youtube":
+            video_id_value = parts[0]["video_id"]
+            result["video_id"] = video_id_value
+            result["title"] = f"YouTube video {video_id_value}"
+            save_history(
+                {
+                    "id": f"{video_id_value}-{result['generated_at']}",
+                    "video_id": video_id_value,
+                    "title": result["title"],
+                    "source": source,
+                    "engine": engine,
+                    "generated_at": result["generated_at"],
+                    "summary": result["summary"],
+                    "segments": result["segments"],
+                    "drivers": result["drivers"],
+                }
+            )
+        else:
+            save_history(
+                {
+                    "id": f"text-{result['generated_at']}",
+                    "video_id": None,
+                    "title": "Built-in demo" if source == "demo" else "Pasted transcript",
+                    "source": source,
+                    "engine": engine,
+                    "generated_at": result["generated_at"],
+                    "summary": result["summary"],
+                    "segments": result["segments"],
+                    "drivers": result["drivers"],
+                }
+            )
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception:
+        app.logger.exception("Analysis failed")
+        return jsonify({"error": "The analysis could not be completed. Please try again."}), 500
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "service": "PulseScope", "timestamp": created_at()})
+
+
+def load_history():
+    try:
+        if not HISTORY_FILE.exists():
+            return []
+        records = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        return records if isinstance(records, list) else []
+    except (OSError, ValueError, TypeError):
+        app.logger.exception("Could not load analysis history")
+        return []
+
+
+def save_history(record):
+    history = load_history()
+    history.insert(0, record)
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(history[:50], indent=2), encoding="utf-8")
+
+
+@app.get("/api/status")
+def status():
+    return jsonify(
+        {
+            "status": "ok",
+            "model": MODEL,
+            "vader": "available",
+            "classifier": "loaded" if classifier is not None else "not-loaded",
+            "timestamp": created_at(),
+        }
+    )
+
+
+@app.get("/api/history")
+def history():
+    return jsonify({"history": load_history()})
+
+
+@app.delete("/api/history")
+def clear_history():
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.write_text("[]\n", encoding="utf-8")
+    return jsonify({"status": "ok", "cleared": True})
+
+
+@app.get("/api/demo")
+def demo():
+    return jsonify(analyze(demo_chunks(), "vader") | {"source": "demo"})
+
+
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=5000)
